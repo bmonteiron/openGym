@@ -77,8 +77,10 @@ jobs:
           KS_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
         run: |
           set -euo pipefail
+          # Segredos colados do Windows podem vir com \r\n no fim; limpa antes de usar.
+          KS_B64=$(printf '%s' "$KS_B64" | tr -d '\r\n '); KS_PASS=${KS_PASS%$'\r'}; KS_ALIAS=$(printf '%s' "$KS_ALIAS" | tr -d '\r\n ')
           if [ -z "$KS_B64" ] || [ -z "$KS_PASS" ] || [ -z "$KS_ALIAS" ]; then echo "Secrets missing"; exit 1; fi
-          echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+          printf '%s' "$KS_B64" | base64 -d > "$RUNNER_TEMP/release.keystore"
           BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
           IN=frontend/android/app/build/outputs/apk/release/app-release-unsigned.apk
           OUT=dist-apk/openGym-plus-${APP_VERSION}.apk
