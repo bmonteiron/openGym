@@ -1,0 +1,109 @@
+# openGym+ : fork build. Compila o APK Android assinado com a chave do fork, sem alterar o
+# código-fonte do upstream: applicationId, nome do app e atualizador interno são trocados
+# por sed em tempo de build, para que `git merge upstream/main` continue sem conflitos.
+name: Build APK (openGym+)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # publica o APK numa Release "latest"
+
+concurrency:
+  group: android-apk
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    if: github.repository == 'bmonteiron/openGym'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Personalize app id, name and updater (build-time only, not committed)
+        run: |
+          set -euo pipefail
+          GRADLE=frontend/android/app/build.gradle
+          STRINGS=frontend/android/app/src/main/res/values/strings.xml
+          UPDATE=frontend/src/lib/update.js
+
+          sed -i 's/applicationId "ch.duartesantos.opengym"/applicationId "io.github.bmonteiron.opengym"/' "$GRADLE"
+          grep -q 'applicationId "io.github.bmonteiron.opengym"' "$GRADLE" || { echo "applicationId not patched"; exit 1; }
+
+          # package_name / custom_url_scheme também carregam o id; app_name é o rótulo do ícone.
+          sed -i 's/ch\.duartesantos\.opengym/io.github.bmonteiron.opengym/g' "$STRINGS"
+          sed -i 's|<string name="app_name">openGym</string>|<string name="app_name">openGym+</string>|' "$STRINGS"
+          grep -q '<string name="app_name">openGym+</string>' "$STRINGS" || { echo "app_name not patched"; exit 1; }
+
+          # O atualizador interno aponta para as releases oficiais no GitLab. No fork, responde
+          # sempre "sem atualização" para não oferecer o APK oficial (outro applicationId/chave).
+          sed -i 's|^async function fetchLatest() {$|async function fetchLatest() {\n  return { hasUpdate: false, latestVersion: __APP_VERSION__, apkUrl: null, hashUrl: null } // openGym+: updater disabled|' "$UPDATE"
+          grep -q 'openGym+: updater disabled' "$UPDATE" || { echo "updater not patched"; exit 1; }
+
+          echo "APP_VERSION=$(node -p "require('./frontend/package.json').version")" >> "$GITHUB_ENV"
+
+      - name: Build web app
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build:mobile
+
+      - name: Build release APK
+        working-directory: frontend/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon
+
+      - name: Sign APK
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          if [ -z "$KS_B64" ] || [ -z "$KS_PASS" ] || [ -z "$KS_ALIAS" ]; then echo "Secrets missing"; exit 1; fi
+          echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          IN=frontend/android/app/build/outputs/apk/release/app-release-unsigned.apk
+          OUT=dist-apk/openGym-plus-${APP_VERSION}.apk
+          mkdir -p dist-apk
+          "$BT/zipalign" -f -p 4 "$IN" "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" sign --ks "$RUNNER_TEMP/release.keystore" --ks-pass env:KS_PASS \
+            --ks-key-alias "$KS_ALIAS" --key-pass env:KS_PASS --out "$OUT" "$RUNNER_TEMP/aligned.apk"
+          rm -f "$RUNNER_TEMP/release.keystore" "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" verify --print-certs "$OUT" | head -5
+          (cd dist-apk && sha256sum "$(basename "$OUT")" > "$(basename "$OUT").sha256")
+          ls -la dist-apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openGym-plus-apk
+          path: dist-apk/*
+
+      # Release rolante "latest": link fixo para instalar pelo celular, sem login no GitHub.
+      - name: Publish rolling "latest" release
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release view latest >/dev/null 2>&1 || gh release create latest --prerelease \
+            --title "openGym+ (latest build)" --notes "Build automático da main. Não é a versão oficial do openGym."
+          gh release upload latest dist-apk/* --clobber
+          gh release edit latest --notes "openGym+ ${APP_VERSION} · commit ${GITHUB_SHA::7} · $(date -u +%Y-%m-%dT%H:%MZ)"
